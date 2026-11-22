@@ -227,6 +227,20 @@ func (p *CFDomainPool) ResetCooldowns() {
 		health.CooldownUntil = 0
 		health.ConsecutiveFailures = 0
 	}
+	p.dcPreferred = make(map[int]string)
+	p.mu.Unlock()
+}
+
+func (p *CFDomainPool) ResetState() {
+	p.mu.Lock()
+	for _, health := range p.health {
+		health.CooldownUntil = 0
+		health.ConsecutiveFailures = 0
+	}
+	p.dcPreferred = make(map[int]string)
+	p.selectionCount = make(map[int]uint64)
+	p.cachedCursor = 0
+	p.builtinCursor = 0
 	p.mu.Unlock()
 }
 

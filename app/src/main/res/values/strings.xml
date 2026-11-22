@@ -998,4 +998,12 @@
     <string name="routes_live_apply_failed">Route changes saved but not applied to the running proxy</string>
     <string name="routes_configuration_required">Configuration required</string>
     <string name="notification_configured_priority">Priority: %1$s</string>
+    <string name="choose_telegram_app">Choose Telegram app</string>
+    <string name="reset_connection_state_button">Reset connection state</string>
+    <string name="reset_connection_state_title">Reset connection state?</string>
+    <string name="reset_connection_state_message">Clears stuck Cloudflare domain caches, cooldown timers and route stats (like clearing temporary connection state) without deleting your app settings.</string>
+    <string name="reset_connection_state_soft">Quick reset (keep link)</string>
+    <string name="reset_connection_state_full">Full reset (+ new secret)</string>
+    <string name="reset_connection_state_done">Connection state reset</string>
+    <string name="reset_connection_state_full_done">Connection state reset and secret updated. Tap "Apply in Telegram".</string>
 </resources>

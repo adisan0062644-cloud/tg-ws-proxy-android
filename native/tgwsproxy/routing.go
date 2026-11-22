@@ -739,10 +739,11 @@ func cfProxyFallbackWithPool(ctx context.Context, client net.Conn, init []byte, 
 	}
 
 	skipCachedUpstream := false
+	cachedUpstreamFailures := 0
 	attempted := false
 	for _, candidate := range selection.Candidates {
 		if skipCachedUpstream && candidate.Source == tgwsroute.CFDomainSourceCachedUpstream {
-			logDebug.Printf("[%s] DC%d%s CF cached upstream skipped domain=%s reason=previous_dns_failure",
+			logDebug.Printf("[%s] DC%d%s CF cached upstream skipped domain=%s reason=previous_failure",
 				label, dc, mTag, candidate.Domain)
 			continue
 		}
@@ -800,10 +801,13 @@ func cfProxyFallbackWithPool(ctx context.Context, client net.Conn, init []byte, 
 		logInfo.Printf("[%s] DC%d%s CF domain cooldown domain=%s reason=%s until=%s",
 			label, dc, mTag, baseDomain, failureKind, formatCooldownUntil(health.CooldownUntil))
 		logDebug.Printf("[%s] DC%d%s CF proxy failed domain=%s detail=%s", label, dc, mTag, baseDomain, reason)
-		if candidate.Source == tgwsroute.CFDomainSourceCachedUpstream && tgwsroute.IsCFDNSFailure(failureKind) {
-			skipCachedUpstream = true
-			logInfo.Printf("[%s] DC%d%s CF cached upstream fast-skip enabled after dns failure domain=%s",
-				label, dc, mTag, baseDomain)
+		if candidate.Source == tgwsroute.CFDomainSourceCachedUpstream {
+			cachedUpstreamFailures++
+			if tgwsroute.IsCFDNSFailure(failureKind) || cachedUpstreamFailures >= 2 {
+				skipCachedUpstream = true
+				logInfo.Printf("[%s] DC%d%s CF cached upstream fast-skip enabled reason=%s failures=%d domain=%s",
+					label, dc, mTag, failureKind, cachedUpstreamFailures, baseDomain)
+			}
 		}
 	}
 
@@ -822,36 +826,49 @@ func cfProxyDialHost(ctx context.Context, client net.Conn, init []byte, label st
 	mTag := mediaTag(isMedia)
 	started := time.Now()
 
-	resolved, err := resolvePreferredIPs(host, 10)
+	resolved, err := resolvePreferredIPsContext(ctx, host, cfProxyAttemptTimeoutSeconds)
 	var candidates []string
 	if err == nil {
 		candidates = resolved.Preferred()
+		if len(candidates) > maxCFProxyResolvedAttempts {
+			candidates = candidates[:maxCFProxyResolvedAttempts]
+		}
 	}
 
 	prefix := fmt.Sprintf("[%s] DC%d%s cfproxy", label, dc, mTag)
-	var ws *RawWebSocket
-	var lastErr error
-	usedTarget := "hostname"
-	connect := newCFProxyWebSocketDialer(ctx, baseDomain, prefix, noTLS)
+	dialMode := func(dialNoTLS bool) (*RawWebSocket, string, error) {
+		connect := newCFProxyWebSocketDialer(ctx, baseDomain, prefix, dialNoTLS)
+		var dialErr error
+		sock, dialErr := connect(host, host, "/apiws", cfProxyAttemptTimeoutSeconds)
+		if dialErr == nil {
+			return sock, "hostname", nil
+		}
+		logDomainConnectFailure(prefix, host, host, dialErr)
 
-	ws, lastErr = connect(host, host, "/apiws", 10)
-	if lastErr != nil {
-		logDomainConnectFailure(prefix, host, host, lastErr)
+		for _, ip := range candidates {
+			if ctx.Err() != nil {
+				return nil, "", ctx.Err()
+			}
+			sock, dialErr = connect(ip, host, "/apiws", cfProxyAttemptTimeoutSeconds)
+			if dialErr == nil {
+				return sock, ip, nil
+			}
+			logDomainConnectFailure(prefix, host, ip, dialErr)
+			var wsErr *WsHandshakeError
+			if errors.As(dialErr, &wsErr) && wsErr.IsRedirect() {
+				break
+			}
+		}
+		return nil, "", dialErr
 	}
 
-	for _, ip := range candidates {
+	ws, usedTarget, lastErr := dialMode(noTLS)
+	effectiveNoTLS := noTLS
+	if ws == nil && noTLS && ctx.Err() == nil && shouldRetryCFProxyWithTLS(lastErr) {
+		logInfo.Printf("%s transport_fallback=wss_443 host=%s reason=%v", prefix, host, lastErr)
+		ws, usedTarget, lastErr = dialMode(false)
 		if ws != nil {
-			break
-		}
-		ws, lastErr = connect(ip, host, "/apiws", 10)
-		if lastErr == nil {
-			usedTarget = ip
-			break
-		}
-		logDomainConnectFailure(prefix, host, ip, lastErr)
-		var wsErr *WsHandshakeError
-		if errors.As(lastErr, &wsErr) && wsErr.IsRedirect() {
-			break
+			effectiveNoTLS = false
 		}
 	}
 
@@ -875,7 +892,7 @@ func cfProxyDialHost(ctx context.Context, client net.Conn, init []byte, label st
 	}
 
 	port := 443
-	if noTLS {
+	if effectiveNoTLS {
 		port = cfPlainWebSocketPort
 	}
 	summary := bridgeWS(ctx, client, ws, label, dc, host, port, isMedia, splitter, bridgeWSMeta{route: routeCFProxyWS})

@@ -179,6 +179,12 @@ func countCFPoolMiss(dc int, now time.Time) int64 {
 	return window.count
 }
 
+func resetCfPoolMissSamples() {
+	cfPoolMissSamples.Lock()
+	cfPoolMissSamples.byDC = make(map[int]cfPoolMissWindow)
+	cfPoolMissSamples.Unlock()
+}
+
 func newMtProtoCFProxyConnector() *mtProtoCFProxyConnector {
 	return &mtProtoCFProxyConnector{}
 }
@@ -235,6 +241,7 @@ func (c *mtProtoCFProxyConnector) Connect(
 	var lastReason string
 	attempted := false
 	skipCachedUpstream := false
+	cachedUpstreamFailures := 0
 	for _, candidate := range selection.Candidates {
 		if err := ctx.Err(); err != nil {
 			result.Reason = "cancelled"
@@ -243,7 +250,7 @@ func (c *mtProtoCFProxyConnector) Connect(
 		}
 		if skipCachedUpstream && candidate.Source == tgwsroute.CFDomainSourceCachedUpstream {
 			if logDebug != nil {
-				logDebug.Printf("MTProto CF cached upstream skipped domain=%s reason=previous_dns_failure", candidate.Domain)
+				logDebug.Printf("MTProto CF cached upstream skipped domain=%s reason=previous_failure", candidate.Domain)
 			}
 			continue
 		}
@@ -297,10 +304,14 @@ func (c *mtProtoCFProxyConnector) Connect(
 				logInfo.Printf("MTProto CF domain cooldown domain=%s reason=%s until=%s",
 					baseDomain, kind, formatCooldownUntil(health.CooldownUntil))
 			}
-			if candidate.Source == tgwsroute.CFDomainSourceCachedUpstream && tgwsroute.IsCFDNSFailure(kind) {
-				skipCachedUpstream = true
-				if logInfo != nil {
-					logInfo.Printf("MTProto CF cached upstream fast-skip enabled after dns failure domain=%s", baseDomain)
+			if candidate.Source == tgwsroute.CFDomainSourceCachedUpstream {
+				cachedUpstreamFailures++
+				if tgwsroute.IsCFDNSFailure(kind) || cachedUpstreamFailures >= 2 {
+					skipCachedUpstream = true
+					if logInfo != nil {
+						logInfo.Printf("MTProto CF cached upstream fast-skip enabled reason=%s failures=%d domain=%s",
+							kind, cachedUpstreamFailures, baseDomain)
+					}
 				}
 			}
 			continue
@@ -368,16 +379,34 @@ func newCFProxyWebSocketDialer(ctx context.Context, serverName, logPrefix string
 	}
 }
 
-func defaultMtProtoCFProxyDial(ctx context.Context, domain, path, logPrefix string, noTLS bool) (mtProtoFrameSocket, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
+const (
+	cfProxyDomainDialBudget      = 6 * time.Second
+	cfProxyAttemptTimeoutSeconds = 3.5
+	maxCFProxyResolvedAttempts   = 2
+)
+
+func shouldRetryCFProxyWithTLS(err error) bool {
+	if err == nil {
+		return false
 	}
-	_, serverName, found := strings.Cut(domain, ".")
-	if !found || serverName == "" {
-		serverName = domain
+	var wsErr *WsHandshakeError
+	if errors.As(err, &wsErr) && wsErr.IsRedirect() {
+		return false
 	}
+	return true
+}
+
+func dialCFProxyTargets(
+	ctx context.Context,
+	domain string,
+	serverName string,
+	path string,
+	logPrefix string,
+	noTLS bool,
+	preferredIPs []string,
+) (mtProtoFrameSocket, error) {
 	connect := newCFProxyWebSocketDialer(ctx, serverName, logPrefix, noTLS)
-	ws, err := connect(domain, domain, path, 10)
+	ws, err := connect(domain, domain, path, cfProxyAttemptTimeoutSeconds)
 	if err == nil {
 		return ws, nil
 	}
@@ -386,17 +415,17 @@ func defaultMtProtoCFProxyDial(ctx context.Context, domain, path, logPrefix stri
 	}
 	logDomainConnectFailure(logPrefix, domain, domain, err)
 
-	resolved, resolveErr := resolvePreferredIPsContext(ctx, domain, 10)
-	if resolveErr != nil {
-		return nil, err
-	}
-
 	lastErr := err
-	for _, ip := range resolved.Preferred() {
+	attempts := 0
+	for _, ip := range preferredIPs {
+		if attempts >= maxCFProxyResolvedAttempts {
+			break
+		}
 		if cancelled := ctx.Err(); cancelled != nil {
 			return nil, cancelled
 		}
-		ws, lastErr = connect(ip, domain, path, 10)
+		attempts++
+		ws, lastErr = connect(ip, domain, path, cfProxyAttemptTimeoutSeconds)
 		if lastErr == nil {
 			return ws, nil
 		}
@@ -410,6 +439,52 @@ func defaultMtProtoCFProxyDial(ctx context.Context, domain, path, logPrefix stri
 		}
 	}
 	return nil, lastErr
+}
+
+func defaultMtProtoCFProxyDial(ctx context.Context, domain, path, logPrefix string, noTLS bool) (mtProtoFrameSocket, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	_, serverName, found := strings.Cut(domain, ".")
+	if !found || serverName == "" {
+		serverName = domain
+	}
+
+	dialCtx, cancel := context.WithTimeout(ctx, cfProxyDomainDialBudget)
+	defer cancel()
+
+	var preferredIPs []string
+	if resolved, resolveErr := resolvePreferredIPsContext(dialCtx, domain, cfProxyAttemptTimeoutSeconds); resolveErr == nil {
+		preferredIPs = resolved.Preferred()
+		if len(preferredIPs) > maxCFProxyResolvedAttempts {
+			preferredIPs = preferredIPs[:maxCFProxyResolvedAttempts]
+		}
+	}
+
+	ws, err := dialCFProxyTargets(dialCtx, domain, serverName, path, logPrefix, noTLS, preferredIPs)
+	if err == nil {
+		return ws, nil
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+
+	if noTLS && shouldRetryCFProxyWithTLS(err) {
+		if logInfo != nil {
+			logInfo.Printf("%s transport_fallback=wss_443 host=%s reason=%v", logPrefix, domain, err)
+		}
+		tlsCtx, tlsCancel := context.WithTimeout(ctx, cfProxyDomainDialBudget)
+		defer tlsCancel()
+		tlsWS, tlsErr := dialCFProxyTargets(tlsCtx, domain, serverName, path, logPrefix, false, preferredIPs)
+		if tlsErr == nil {
+			return tlsWS, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, tlsErr
+	}
+	return nil, err
 }
 
 func mtProtoWebSocketConn(ws mtProtoFrameSocket, relayInit []byte, remote string) (net.Conn, error) {

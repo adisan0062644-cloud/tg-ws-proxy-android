@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"testing"
+	"time"
 
 	"tg-ws-proxy/mtproxyfrontend"
 )
@@ -289,4 +291,96 @@ func (timeoutErr) Timeout() bool {
 
 func (timeoutErr) Temporary() bool {
 	return true
+}
+
+func TestMtProtoCFProxyConnectorFastSkipsCachedAfterTwoNonDNSFailures(t *testing.T) {
+	withRuntimeSettings(t, func(settings runtimeSettings) runtimeSettings {
+		settings.CF.Enabled = true
+		settings.CF.Only = false
+		settings.CF.Priority = false
+		return settings
+	})
+
+	previous := cfPool
+	cfPool = newCFDomainPool()
+	cfPool.SetCachedUpstreamDomains([]string{"cached-1.example", "cached-2.example", "cached-3.example"})
+	cfPool.SetBuiltinDomains([]string{"builtin.example"})
+	t.Cleanup(func() {
+		cfPool = previous
+	})
+
+	socket := &fakeMtProtoFrameSocket{}
+	var attempts []string
+	connector := &mtProtoCFProxyConnector{
+		dial: func(domain, path, _ string) (mtProtoFrameSocket, error) {
+			attempts = append(attempts, domain)
+			if domain == "kws2.builtin.example" {
+				return socket, nil
+			}
+			return nil, errors.New("connection timeout")
+		},
+	}
+
+	relayInit := buildTestInitWithSignedDC(t, 2)
+	conn, result := connector.Connect(context.Background(), mtproxyfrontend.OutboundRequest{
+		DCID:      2,
+		Transport: mtproxyfrontend.TransportAbridged,
+		RelayInit: relayInit,
+	})
+	if result.Err != nil {
+		t.Fatalf("connect: %v", result.Err)
+	}
+	defer conn.Close()
+
+	// Should try first two cached upstream domains, then fast-skip cached-3 and reach builtin.
+	if len(attempts) != 3 {
+		t.Fatalf("attempts=%v want 3 attempts ending at kws2.builtin.example", attempts)
+	}
+	if attempts[2] != "kws2.builtin.example" {
+		t.Fatalf("last attempt=%s want kws2.builtin.example (attempts=%v)", attempts[2], attempts)
+	}
+}
+
+func TestResetNativeTransientConnectionStateClearsCooldownsAndMissSamples(t *testing.T) {
+	previous := cfPool
+	cfPool = newCFDomainPool()
+	t.Cleanup(func() {
+		cfPool = previous
+	})
+
+	cfPool.SetBuiltinDomains([]string{"builtin.example"})
+	cfPool.MarkFailure(2, "builtin.example", "http_403", 100)
+	if !cfPool.IsCoolingDown(2, "builtin.example") {
+		t.Fatal("expected CF domain cooldown before reset")
+	}
+
+	markDirectIPTimeout("149.154.167.51", monoNow())
+	if !directIPCoolingDown("149.154.167.51", monoNow()) {
+		t.Fatal("expected direct IP cooldown before reset")
+	}
+
+	now := time.Now()
+	markDirectTCPFailure(2, "149.154.167.51", 443, directTCPFailureTimeout, now)
+	if _, active := activeDirectTCPCooldown(2, "149.154.167.51", 443, now.Add(time.Second)); !active {
+		t.Fatal("expected direct TCP cooldown before reset")
+	}
+
+	if count := countCFPoolMiss(2, now); count != 1 {
+		t.Fatalf("miss count=%d want 1", count)
+	}
+
+	resetNativeTransientConnectionState()
+
+	if cfPool.IsCoolingDown(2, "builtin.example") {
+		t.Fatal("CF domain cooldown should be cleared after reset")
+	}
+	if directIPCoolingDown("149.154.167.51", monoNow()) {
+		t.Fatal("direct IP cooldown should be cleared after reset")
+	}
+	if _, active := activeDirectTCPCooldown(2, "149.154.167.51", 443, now.Add(time.Second)); active {
+		t.Fatal("direct TCP cooldown should be cleared after reset")
+	}
+	if count := countCFPoolMiss(2, now.Add(time.Second)); count != 1 {
+		t.Fatalf("miss count after reset=%d want 1", count)
+	}
 }

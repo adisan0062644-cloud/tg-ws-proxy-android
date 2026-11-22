@@ -140,8 +140,12 @@ func directTCPBackoff(reason string, failures int) time.Duration {
 	return delay
 }
 
-func resetDirectTCPHealthForTests() {
+func clearDirectTCPCooldowns() {
 	directTCPHealthRuntime.Lock()
 	directTCPHealthRuntime.states = make(map[directTCPHealthKey]directTCPHealthState)
 	directTCPHealthRuntime.Unlock()
+}
+
+func resetDirectTCPHealthForTests() {
+	clearDirectTCPCooldowns()
 }

@@ -3424,6 +3424,23 @@ func stopMtProtoWorkerPreconnect(closePool bool) {
 	}
 }
 
+func resetNativeTransientConnectionState() {
+	wsBlackMu.Lock()
+	wsBlacklist = make(map[[2]int]bool)
+	wsBlackMu.Unlock()
+
+	dcFailMu.Lock()
+	dcFailUntil = make(map[[2]int]float64)
+	dcFailMu.Unlock()
+
+	cfPool.ResetState()
+	resetCfPoolMissSamples()
+	resetWorkerRouteCooldowns()
+	clearDirectIPCooldowns()
+	clearDirectTCPCooldowns()
+	resetProxyRouteDisplayState()
+}
+
 //export StartProxy
 func StartProxy(cHost *C.char, port C.int, cDcIps *C.char, verbose C.int) C.int {
 	globalMu.Lock()
@@ -3447,6 +3464,7 @@ func StartProxy(cHost *C.char, port C.int, cDcIps *C.char, verbose C.int) C.int 
 	}
 	setRuntimeSettings(settings)
 	setCfProxyConfig(settings.CF)
+	resetNativeTransientConnectionState()
 
 	globalCtx, globalCancel = context.WithCancel(context.Background())
 
@@ -3482,19 +3500,9 @@ func StopProxy() C.int {
 	// Reset state
 	stats.Reset()
 
-	wsBlackMu.Lock()
-	wsBlacklist = make(map[[2]int]bool)
-	wsBlackMu.Unlock()
-
-	dcFailMu.Lock()
-	dcFailUntil = make(map[[2]int]float64)
-	dcFailMu.Unlock()
-
 	wsPool.CloseAll()
 	workerPool.CloseAll()
-	resetWorkerRouteCooldowns()
-	clearDirectIPCooldowns()
-	resetProxyRouteDisplayState()
+	resetNativeTransientConnectionState()
 
 	return 0
 }
@@ -3515,6 +3523,7 @@ func StartMtProtoProxy(cHost *C.char, port C.int, cSecret *C.char, cRuntimeConfi
 	}
 	setRuntimeSettings(settings)
 	setCfProxyConfig(settings.CF)
+	resetNativeTransientConnectionState()
 	dcOptMu.Lock()
 	dcOpt = dcOptMap
 	dcOptMu.Unlock()
@@ -3593,6 +3602,7 @@ func StopMtProtoProxy() C.int {
 		return -1
 	}
 	stopMtProtoWorkerPreconnect(true)
+	resetNativeTransientConnectionState()
 	return 0
 }
 
@@ -3625,6 +3635,14 @@ func GetStats() *C.char {
 //export ResetCFDomainCooldowns
 func ResetCFDomainCooldowns() {
 	cfPool.ResetCooldowns()
+}
+
+//export ResetProxyConnectionState
+func ResetProxyConnectionState() {
+	resetNativeTransientConnectionState()
+	if logInfo != nil {
+		logInfo.Printf("Native proxy transient connection state reset")
+	}
 }
 
 //export SetCachedCFDomains

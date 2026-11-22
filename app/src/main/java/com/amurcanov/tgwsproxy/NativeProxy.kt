@@ -15,6 +15,7 @@ interface ProxyLibrary : Library {
     fun SetPoolSize(size: Int)
     fun GetStats(): Pointer?
     fun ResetCFDomainCooldowns()
+    fun ResetProxyConnectionState()
     fun SetManualCFDomains(domains: String)
     fun SetCachedCFDomains(domains: String)
     fun GetAdaptiveRouteStats(): Pointer?
@@ -80,7 +81,15 @@ object NativeProxy {
         return res
     }
     fun resetCfDomainCooldowns() {
-        ProxyLibrary.INSTANCE.ResetCFDomainCooldowns()
+        runCatching { ProxyLibrary.INSTANCE.ResetCFDomainCooldowns() }
+    }
+    fun resetConnectionState() {
+        val resetAllResult = runCatching {
+            ProxyLibrary.INSTANCE.ResetProxyConnectionState()
+        }
+        if (resetAllResult.isFailure) {
+            runCatching { ProxyLibrary.INSTANCE.ResetCFDomainCooldowns() }
+        }
     }
     fun setManualCfDomains(domains: List<String>) {
         val payload = domains.mapNotNull(CfDomain::normalizeOrNull).distinct().joinToString("|")
@@ -264,6 +273,9 @@ object NativeProxy {
     }
     fun resetAdaptiveRouteStats(all: Boolean) {
         ProxyLibrary.INSTANCE.ResetAdaptiveRouteStats(if (all) 1 else 0)
+    }
+    fun resetAdaptiveRouteStatsSafe(all: Boolean) {
+        runCatching { resetAdaptiveRouteStats(all) }
     }
     fun resetAdaptiveNetworkRouteStats(profileId: String) {
         ProxyLibrary.INSTANCE.ResetAdaptiveNetworkRouteStats(profileId)

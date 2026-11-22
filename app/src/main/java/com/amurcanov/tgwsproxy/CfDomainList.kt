@@ -603,6 +603,42 @@ class CfDomainListRepository(
         )
     }
 
+    fun clearCache(): CfDomainUpstreamState {
+        return save(
+            state().copy(
+                domains = emptyList(),
+                lastUpdatedAtMs = 0L,
+                lastAttemptAtMs = 0L,
+                lastSuccessfulUpdateAtMs = 0L,
+                lastError = null,
+                lastErrorStage = null,
+                lastSuccessfulSource = null,
+                etag = null,
+                lastModified = null,
+                primaryStatus = state().primaryStatus.copy(
+                    lastAttemptAtMs = 0L,
+                    lastSuccessAtMs = 0L,
+                    lastError = null,
+                    lastHttpStatus = null,
+                    lastLatencyMs = null,
+                    lastStage = null,
+                    etag = null,
+                    lastModified = null,
+                ),
+                mirrorStatus = state().mirrorStatus.copy(
+                    lastAttemptAtMs = 0L,
+                    lastSuccessAtMs = 0L,
+                    lastError = null,
+                    lastHttpStatus = null,
+                    lastLatencyMs = null,
+                    lastStage = null,
+                    etag = null,
+                    lastModified = null,
+                ),
+            ),
+        )
+    }
+
     private fun save(state: CfDomainUpstreamState): CfDomainUpstreamState {
         persistence.save(state)
         return state

@@ -96,22 +96,7 @@ import kotlin.math.max
 
 // DataCenters list removed
 
-val telegramApps = listOf(
-    "org.telegram.messenger",
-    "org.thunderdog.challegram",
-    "com.radolyn.ayugram",
-    "app.exteragram.messenger",
-    "ir.ilmili.telegraph",
-    "org.telegram.plus",
-    "tw.nekomimi.nekogram",
-    "tw.nekomimi.nekogramx",
-    "org.telegram.mdgram",
-    "com.iMe.android",
-    "app.nicegram",
-    "org.telegram.bgram",
-    "cc.modery.cherrygram",
-    "io.github.nextalone.nagram"
-)
+val telegramApps: List<String> = TelegramAppLauncher.knownTelegramPackages
 
 private enum class PendingFolderAction {
     SaveRuntimeLogs,
@@ -518,6 +503,7 @@ private fun ProxyScreen(
     var showTipsModal by remember { mutableStateOf(false) }
     var showIpSetupModal by remember { mutableStateOf(false) }
     var showExitConfirm by remember { mutableStateOf(false) }
+    var showResetStateConfirm by remember { mutableStateOf(false) }
     var reportFolderUriText by remember { mutableStateOf(prefs.getString("report_folder_uri", "") ?: "") }
     var lastLogStatus by remember { mutableStateOf(prefs.getString("last_log_status", "") ?: "") }
     var isSavingLogs by remember { mutableStateOf(false) }
@@ -1240,10 +1226,13 @@ private fun ProxyScreen(
                     "fake_tls=${normalizedCandidate.fakeTlsDomain.isNotBlank()} " +
                     "fake_tls_passthrough=${normalizedCandidate.fakeTlsPassthrough}",
             )
+            val builtConfig = runtimeConfigFactory().build(context)
+            routePolicySnapshot = RoutePolicyDiagnostics.buildSnapshot(context, prefs, routePolicyRepository)
+            builtConfig?.let { lastRuntimeConfigKey = runtimeConfigKey(it) }
             val startIntent = Intent(context, ProxyService::class.java).apply {
                 action = ProxyService.ACTION_START
                 putExtra(ProxyService.EXTRA_PORT, normalizedCandidate.port)
-                runtimeConfigFactory().build(context)?.let { routeConfig ->
+                builtConfig?.let { routeConfig ->
                     putExtra(ProxyService.EXTRA_IPS, routeConfig.ips)
                     putExtra(ProxyService.EXTRA_POOL_SIZE, routeConfig.poolSize)
                 }
@@ -1821,6 +1810,22 @@ private fun ProxyScreen(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.fillMaxWidth().padding(top = 6.dp)
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    OutlinedButton(
+                        onClick = { showResetStateConfirm = true },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(52.dp),
+                        shape = RoundedCornerShape(12.dp),
+                    ) {
+                        Text(
+                            stringResource(R.string.reset_connection_state_button),
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Medium,
                         )
                     }
 
@@ -2460,7 +2465,7 @@ private fun ProxyScreen(
                             },
                             onResetCooldown = {
                                 CfDomainDiagnosticsState.resetCooldowns()
-                                NativeProxy.resetCfDomainCooldowns()
+                                NativeProxy.resetConnectionState()
                                 cfDomainRows = CfDomainDiagnosticsState.snapshot(
                                     manualCfDomains,
                                     cfUpstreamState.domains,
@@ -3182,6 +3187,66 @@ private fun ProxyScreen(
         )
     }
 
+    if (showResetStateConfirm) {
+        val performStateReset = { regenerateSecret: Boolean ->
+            showResetStateConfirm = false
+            val resetResult = ProxyStateResetManager.resetConnectionState(
+                context = context,
+                prefs = prefs,
+                regenerateSecret = regenerateSecret,
+                reconnectIfRunning = true,
+                runtimeRunning = isRunning,
+            )
+            cfUpstreamState = resetResult.upstreamState
+            cfDomainRows = CfDomainDiagnosticsState.snapshot(
+                manualCfDomains,
+                resetResult.upstreamState.domains,
+            )
+            mtProtoProxyConfig = resetResult.mtProtoConfig
+            lastRuntimeConfigKey = ""
+            Toast.makeText(
+                context,
+                context.getString(
+                    if (regenerateSecret) {
+                        R.string.reset_connection_state_full_done
+                    } else {
+                        R.string.reset_connection_state_done
+                    },
+                ),
+                Toast.LENGTH_LONG,
+            ).show()
+        }
+        AlertDialog(
+            onDismissRequest = { showResetStateConfirm = false },
+            title = { Text(stringResource(R.string.reset_connection_state_title)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(stringResource(R.string.reset_connection_state_message))
+                    Button(
+                        onClick = { performStateReset(false) },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                    ) {
+                        Text(stringResource(R.string.reset_connection_state_soft))
+                    }
+                    OutlinedButton(
+                        onClick = { performStateReset(true) },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                    ) {
+                        Text(stringResource(R.string.reset_connection_state_full))
+                    }
+                }
+            },
+            confirmButton = {},
+            dismissButton = {
+                TextButton(onClick = { showResetStateConfirm = false }) {
+                    Text(stringResource(R.string.routes_reset_cancel))
+                }
+            },
+        )
+    }
+
     if (showIpSetupModal) {
         IpSetupDialog(
             flowsealDcOnlyEnabled = flowsealDcOnlyEnabled,
@@ -3620,32 +3685,7 @@ fun formatLogLine(raw: String): String {
 }
 
 fun openTelegram(context: Context, url: String) {
-    val pm = context.packageManager
-    val uri = Uri.parse(url)
-    
-    for (pkg in telegramApps) {
-        try {
-            pm.getPackageInfo(pkg, 0)
-            val intent = Intent(Intent.ACTION_VIEW, uri)
-            intent.setPackage(pkg)
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            context.startActivity(intent)
-            return
-        } catch (e: PackageManager.NameNotFoundException) {
-            // App not found, skip
-        } catch (e: Exception) {
-            // Activity not found or other err
-        }
-    }
-    
-    // Fallback: just open any app that handles tg:// link
-    try {
-        val fallbackIntent = Intent(Intent.ACTION_VIEW, uri)
-        fallbackIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        context.startActivity(fallbackIntent)
-    } catch (e: Exception) {
-        Toast.makeText(context, context.getString(R.string.telegram_not_found), Toast.LENGTH_SHORT).show()
-    }
+    TelegramAppLauncher.openTelegram(context, url)
 }
 
 @Composable

@@ -37,6 +37,9 @@ class ProxyService : Service() {
     private val pendingCommands = AtomicInteger()
     private var allowTileConfirmation = false
     private val speedSampler = SpeedSampler()
+    private val connectionWatchdog = ProxyConnectionWatchdog()
+    private var networkChangeMonitor: NetworkChangeMonitor? = null
+    private var lastNetworkMonitorEventAtMs: Long = 0L
     private val notificationUpdateGate = ProxyNotificationUpdateGate()
     private var foregroundNotificationActive = false
     private var currentFrontend: LocalProxyFrontend = localProxyFrontendFor(LocalProxyFrontendType.DEFAULT)
@@ -117,9 +120,29 @@ class ProxyService : Service() {
                         allowTileConfirmation = commandIntent.hasExtra(EXTRA_PORT)
                         loadLastConfig()
                         logAction("start")
-                        val port = commandIntent.getIntExtra(EXTRA_PORT, lastPort)
-                        val ips = commandIntent.getStringExtra(EXTRA_IPS).orEmpty().ifBlank { lastIps }
-                        val poolSize = commandIntent.getIntExtra(EXTRA_POOL_SIZE, lastPoolSize)
+                        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                        val hasExplicitPort = commandIntent.hasExtra(EXTRA_PORT)
+                        val hasExplicitIps = commandIntent.hasExtra(EXTRA_IPS)
+                        val freshConfig = if (!hasExplicitIps) {
+                            ProxyRuntimeConfigFactory.fromPreferences(prefs).build(this@ProxyService)
+                        } else {
+                            null
+                        }
+                        val port = if (hasExplicitPort) {
+                            commandIntent.getIntExtra(EXTRA_PORT, lastPort)
+                        } else {
+                            freshConfig?.port ?: lastPort
+                        }
+                        val ips = if (hasExplicitIps) {
+                            commandIntent.getStringExtra(EXTRA_IPS).orEmpty()
+                        } else {
+                            freshConfig?.ips?.ifBlank { lastIps } ?: lastIps
+                        }
+                        val poolSize = if (commandIntent.hasExtra(EXTRA_POOL_SIZE)) {
+                            commandIntent.getIntExtra(EXTRA_POOL_SIZE, lastPoolSize)
+                        } else {
+                            freshConfig?.poolSize ?: lastPoolSize
+                        }
                         val frontendType = lastFrontendType
                         if (port !in 1..65535 || poolSize <= 0 ||
                             (frontendType == LocalProxyFrontendType.SOCKS5 && ips.isBlank())
@@ -212,6 +235,9 @@ class ProxyService : Service() {
         poolSize: Int,
         frontendType: LocalProxyFrontendType,
     ) {
+        NativeProxy.resetConnectionState()
+        CfDomainDiagnosticsState.resetCooldowns()
+        connectionWatchdog.reset()
         val frontend = localProxyFrontendFor(frontendType)
         val config = buildFrontendConfig(frontendType, port, ips, poolSize)
         logFrontendSelected(frontendType, config)
@@ -263,7 +289,14 @@ class ProxyService : Service() {
         acquireWakeLock()
         speedSampler.reset()
         _isRunning.value = true
-        ProxyRuntimeState.update { it.copy(serviceStatus = ProxyServiceStatus.RUNNING) }
+        val configuredFirst = extractConfiguredFirstRoute(ips)
+        ProxyRuntimeState.update {
+            it.copy(
+                serviceStatus = ProxyServiceStatus.RUNNING,
+                configuredRouteKind = configuredFirst,
+            )
+        }
+        startNetworkMonitor()
         startMetricsLoop()
         updateNotification(force = true)
         ProxyQuickSettingsTileService.requestRefresh(this)
@@ -274,7 +307,15 @@ class ProxyService : Service() {
         config: LocalProxyFrontendConfig,
     ) {
         val wasRunning = _isRunning.value
-        if (!wasRunning) {
+        if (wasRunning) {
+            ProxyRuntimeState.update {
+                it.copy(serviceStatus = ProxyServiceStatus.RECONNECTING)
+            }
+            updateNotification(force = true)
+            stopNativeOnly()
+            _isRunning.value = false
+            Thread.sleep(200)
+        } else {
             ProxyRuntimeState.update {
                 it.copy(serviceStatus = ProxyServiceStatus.STARTING)
             }
@@ -293,13 +334,10 @@ class ProxyService : Service() {
         }
         logFrontendStartResult(result)
         if (result.state.status != LocalProxyFrontendStatus.RUNNING) {
-            handleFrontendStartFailure(frontend, result, wasRunning, port = config.port)
+            handleFrontendStartFailure(frontend, result, wasRunning = false, port = config.port)
             return
         }
 
-        if (wasRunning) {
-            stopNativeOnly()
-        }
         saveLastConfig(
             config.port,
             config.runtimeConfig,
@@ -311,12 +349,15 @@ class ProxyService : Service() {
         speedSampler.reset()
         currentFrontend = frontend
         _isRunning.value = true
+        val configuredFirst = extractConfiguredFirstRoute(config.runtimeConfig)
         ProxyRuntimeState.update {
             it.copy(
                 runtime = readRuntimeMetrics(LocalProxyFrontendType.MTPROTO_EXPERIMENTAL),
                 serviceStatus = ProxyServiceStatus.RUNNING,
+                configuredRouteKind = configuredFirst,
             )
         }
+        startNetworkMonitor()
         startMetricsLoop()
         updateNotification(force = true)
         ProxyQuickSettingsTileService.requestRefresh(this)
@@ -452,24 +493,38 @@ class ProxyService : Service() {
     }
 
     private fun reconnectProxy() {
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        loadLastConfig()
+        val fresh = ProxyRuntimeConfigFactory.fromPreferences(prefs).build(this)
+        val port = fresh?.port ?: lastPort
+        val ips = fresh?.ips?.ifBlank { lastIps } ?: lastIps
+        val poolSize = fresh?.poolSize ?: lastPoolSize
+        val frontendType = lastFrontendType
+
+        NativeProxy.resetConnectionState()
+        CfDomainDiagnosticsState.resetCooldowns()
+        connectionWatchdog.reset()
+
         if (!_isRunning.value) {
-            loadLastConfig()
-            if (lastFrontendType == LocalProxyFrontendType.MTPROTO_EXPERIMENTAL || lastIps.isNotBlank()) {
-                startProxy(lastPort, lastIps, lastPoolSize, lastFrontendType)
+            if (frontendType == LocalProxyFrontendType.MTPROTO_EXPERIMENTAL || ips.isNotBlank()) {
+                startProxy(port, ips, poolSize, frontendType)
             }
             return
         }
         val type = currentFrontend.type
         if (type == LocalProxyFrontendType.MTPROTO_EXPERIMENTAL) {
-            // Native MTProto start cannot rebind the port while the old listener is active.
-            stopProxy()
-            startProxy(lastPort, lastIps, lastPoolSize, type)
+            ProxyRuntimeState.update { it.copy(serviceStatus = ProxyServiceStatus.RECONNECTING) }
+            updateNotification(force = true)
+            stopNativeOnly()
+            _isRunning.value = false
+            Thread.sleep(250)
+            startProxy(port, ips, poolSize, type)
             return
         }
         restartSocks5(
             localProxyFrontendFor(type),
-            buildFrontendConfig(type, lastPort, lastIps, lastPoolSize),
-            saveConfig = false,
+            buildFrontendConfig(type, port, ips, poolSize),
+            saveConfig = true,
         )
     }
 
@@ -575,15 +630,72 @@ class ProxyService : Service() {
     }
 
     private fun stopProxy() {
+        stopNetworkMonitor()
         metricsJob?.cancel()
         metricsJob = null
+        connectionWatchdog.reset()
         runCatching { stopNativeOnly() }
+        NativeProxy.resetConnectionState()
         PersistentLogStore.flushAsync()
         releaseWakeLock()
         _isRunning.value = false
         ProxyRuntimeState.reset()
         stopForegroundServiceNotification()
         ProxyQuickSettingsTileService.requestRefresh(this)
+    }
+
+    private fun extractConfiguredFirstRoute(runtimeConfig: String): String {
+        return runtimeConfig.split(',')
+            .firstOrNull { it.startsWith("@route_order=") }
+            ?.substringAfter('=')
+            ?.substringBefore('|')
+            .orEmpty()
+    }
+
+    @Synchronized
+    private fun startNetworkMonitor() {
+        if (networkChangeMonitor != null) return
+        val monitor = NetworkChangeMonitor(
+            context = applicationContext,
+            coroutineScope = serviceScope,
+            onNetworkChanged = { profile ->
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastNetworkMonitorEventAtMs < 2_500L) {
+                    return@NetworkChangeMonitor
+                }
+                lastNetworkMonitorEventAtMs = now
+                if (!_isRunning.value) {
+                    return@NetworkChangeMonitor
+                }
+                commandScope.launch {
+                    if (!_isRunning.value) return@launch
+                    NativeProxy.resetConnectionState()
+                    CfDomainDiagnosticsState.resetCooldowns()
+                    connectionWatchdog.reset()
+                    val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                    val fresh = ProxyRuntimeConfigFactory.fromPreferences(prefs).build(this@ProxyService)
+                    if (fresh != null && fresh.ips.isNotBlank() &&
+                        (fresh.ips != lastIps || currentFrontend.type == LocalProxyFrontendType.MTPROTO_EXPERIMENTAL)
+                    ) {
+                        reconfigureProxy(fresh.port, fresh.ips, fresh.poolSize, currentFrontend.type)
+                    }
+                    AppLogger.i(
+                        context = this@ProxyService,
+                        category = AppLogCategory.NETWORK,
+                        message = "SERVICE_NETWORK_RECOVERY_REFRESH",
+                        details = mapOf("networkType" to profile.type.prefValue),
+                    )
+                }
+            },
+        )
+        monitor.start()
+        networkChangeMonitor = monitor
+    }
+
+    @Synchronized
+    private fun stopNetworkMonitor() {
+        networkChangeMonitor?.stop()
+        networkChangeMonitor = null
     }
 
     private fun startMetricsLoop() {
@@ -599,6 +711,7 @@ class ProxyService : Service() {
                     continue
                 }
                 val runtime = readRuntimeMetrics(currentFrontend.type)
+                handleWatchdogSample(runtime)
                 // Best-effort large transfer detection (aggregate bytes counters).
                 runCatching {
                     val now = System.currentTimeMillis()
@@ -655,6 +768,53 @@ class ProxyService : Service() {
                     // Show a newly connected backend promptly; regular speed/status
                     // refreshes remain throttled by ProxyNotificationUpdateGate.
                     updateNotification(force = confirmedRouteChanged)
+                }
+            }
+        }
+    }
+
+    private fun handleWatchdogSample(runtime: ProxyRuntimeMetrics) {
+        val evaluation = connectionWatchdog.onSample(runtime)
+        when (evaluation.action) {
+            WatchdogAction.NONE -> Unit
+            WatchdogAction.SOFT_HEAL -> {
+                AppLogger.w(
+                    context = this,
+                    category = AppLogCategory.APP,
+                    message = "WATCHDOG_SOFT_HEAL",
+                    details = mapOf("reason" to evaluation.reason),
+                )
+                commandScope.launch {
+                    if (!_isRunning.value) return@launch
+                    NativeProxy.resetConnectionState()
+                    CfDomainDiagnosticsState.resetCooldowns()
+                    if (currentFrontend.type == LocalProxyFrontendType.MTPROTO_EXPERIMENTAL) {
+                        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                        val fresh = ProxyRuntimeConfigFactory.fromPreferences(prefs).build(this@ProxyService)
+                        if (fresh != null && fresh.ips.isNotBlank()) {
+                            runCatching { NativeProxy.updateMtProtoRoutePolicy(fresh.ips) }
+                        }
+                    }
+                }
+            }
+            WatchdogAction.DEEP_HEAL -> {
+                AppLogger.w(
+                    context = this,
+                    category = AppLogCategory.APP,
+                    message = "WATCHDOG_DEEP_HEAL",
+                    details = mapOf("reason" to evaluation.reason),
+                )
+                commandScope.launch {
+                    if (!_isRunning.value) return@launch
+                    val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                    ProxyStateResetManager.resetConnectionState(
+                        context = applicationContext,
+                        prefs = prefs,
+                        regenerateSecret = false,
+                        reconnectIfRunning = false,
+                        runtimeRunning = _isRunning.value,
+                    )
+                    reconnectProxy()
                 }
             }
         }
@@ -939,10 +1099,13 @@ class ProxyService : Service() {
     }
 
     override fun onDestroy() {
+        stopNetworkMonitor()
         metricsJob?.cancel()
+        connectionWatchdog.reset()
         if (_isRunning.value) {
             runCatching { stopNativeOnly() }
         }
+        NativeProxy.resetConnectionState()
         _isRunning.value = false
         ProxyRuntimeState.reset()
         releaseWakeLock()

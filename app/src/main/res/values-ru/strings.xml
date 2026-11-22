@@ -998,4 +998,12 @@
     <string name="routes_live_apply_failed">Маршруты сохранены, но не применены к работающему прокси</string>
     <string name="routes_configuration_required">Требуется настройка</string>
     <string name="notification_configured_priority">Приоритет: %1$s</string>
+    <string name="choose_telegram_app">Выберите клиент Telegram</string>
+    <string name="reset_connection_state_button">Сбросить состояние подключения</string>
+    <string name="reset_connection_state_title">Сбросить состояние подключения?</string>
+    <string name="reset_connection_state_message">Очищает зависший кэш доменов Cloudflare, блокировки (cooldown) и статистику маршрутов — как «Очистка данных», но без сброса ваших настроек.</string>
+    <string name="reset_connection_state_soft">Быстрый сброс (сохранить ссылку)</string>
+    <string name="reset_connection_state_full">Полный сброс (+ новый секрет)</string>
+    <string name="reset_connection_state_done">Состояние подключения сброшено</string>
+    <string name="reset_connection_state_full_done">Состояние сброшено и создан новый секрет. Нажмите «Применить в Telegram».</string>
 </resources>
